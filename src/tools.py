@@ -1,1789 +1,482 @@
-"""Tools cho ReAct Agent tư vấn quà tặng bằng LLM generation.
-
-Role 2 chỉ định nghĩa tool, contract, validation và safeguards. Module không
-hard-code API key và không phụ thuộc trực tiếp vào một SDK LLM cụ thể. Role 4
-cấu hình một structured-LLM callable thông qua :func:`configure_tool_llm`.
-
-Pipeline:
-    1. ``extract_recipient_profile``: LLM trích xuất hồ sơ có cấu trúc.
-    2. ``analyze_recipient_profile``: LLM tạo brief/insight chọn quà.
-    3. ``generate_gift_candidates``: LLM sinh concept; Python validate, score,
-       sort và gán rank.
-    4. ``explain_recommendations``: LLM giải thích grounded; Python giữ khóa
-       rank, ID, components và khoảng giá từ Tool 3.
-
-Lưu ý:
-    Candidate là ý tưởng quà do LLM sinh, không phải sản phẩm hoặc giá thị
-    trường đã được xác minh. Mọi đề xuất đều cần kiểm tra lại trước khi mua.
-"""
-
+"""LLM-backed gift-advice tools: LLM drafts; Python validates and ranks."""
 from __future__ import annotations
+import json, re, sys, time, unicodedata
+from collections.abc import Callable
+from difflib import SequenceMatcher
+from typing import Any
 
-import json
-import re
-import sys
-import unicodedata
-from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, TypeAlias
-
-# Hỗ trợ hiển thị tiếng Việt trong Windows Console, không ảnh hưởng logic tool.
-if getattr(sys.stdout, "encoding", None) and sys.stdout.encoding.lower() != "utf-8":
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except (AttributeError, OSError):
         pass
 
-JsonObject: TypeAlias = dict[str, Any]
-StructuredLLMResult: TypeAlias = JsonObject | str
-StructuredLLMCallable: TypeAlias = Callable[
-    [str, JsonObject, JsonObject], StructuredLLMResult
-]
-
+StructuredLLMCallable = Callable[[str, dict[str, Any]], dict[str, Any]]
 _TOOL_LLM: StructuredLLMCallable | None = None
-_MAX_API_ATTEMPTS = 2  # Lần gọi đầu + tối đa 1 retry cho lỗi tạm thời.
+PROFILE_FIELDS = ("traits","interests","preferences","exclusions","relationship","occasion","age","budget_vnd")
+LIST_FIELDS = PROFILE_FIELDS[:4]
+ANALYSIS_LIST_FIELDS = ("priority_interests","preferred_gift_styles","avoid_features","generation_guidelines","clarification_questions","analysis_notes")
+CANDIDATE_LIST_FIELDS = ("fit_tags","gift_styles","suitable_occasions","suitable_relationships","possible_risks")
+URL_RE = re.compile(r"(?:https?://|www\\.|\\b[a-z0-9-]+\\.(?:com|vn|net|org)\\b)", re.I)
+SHOP_RE = re.compile(r"\\b(?:shop|store|cửa\\s*hàng|thương\\s*hiệu|brand)\\b", re.I)
 
+class ToolFailure(Exception):
+    """Internal safe error carrier."""
+    def __init__(self, code: str, message: str, *, field: str | None=None, retryable: bool=False) -> None:
+        super().__init__(message)
+        self.code,self.message,self.field,self.retryable=code,message,field,retryable
 
-@dataclass(frozen=True)
-class _ToolFailure(Exception):
-    """Lỗi nội bộ có thể chuyển an toàn thành Observation JSON."""
+def configure_tool_llm(llm_callable: StructuredLLMCallable) -> None:
+    """Configure the structured LLM dependency used by all tools.
 
-    code: str
-    message: str
-    field: str | None = None
-    retryable: bool = False
-
-
-# =============================================================================
-# LLM CONFIGURATION
-# =============================================================================
-
-def configure_tool_llm(llm_callable: StructuredLLMCallable | None) -> None:
-    """Cấu hình structured LLM callable được dùng bởi bốn public tool.
-
-    Args:
-        llm_callable: Hàm nhận ba tham số theo thứ tự ``system_prompt``,
-            ``payload`` và ``response_schema``; trả về dictionary hoặc JSON
-            string. Truyền ``None`` để gỡ cấu hình hiện tại.
-
-    Returns:
-        Không trả về dữ liệu.
-
-    Error semantics:
-        Ném ``TypeError`` nếu giá trị không callable và không phải ``None``.
-        Đây là lỗi cấu hình của lập trình viên, không phải lỗi nghiệp vụ từ
-        người dùng.
-
-    Side effects:
-        Thay đổi callable dùng chung trong module.
-
-    Safety:
-        Không nhận hoặc lưu API key. Role 4 chịu trách nhiệm tạo client và đọc
-        API key từ biến môi trường.
-
-    Example:
-        >>> configure_tool_llm(my_structured_llm_adapter)
+    Summary: Install one reusable callable; this module never reads API keys.
+    Role in pipeline: One-time setup before Tools 1-4.
+    Args: llm_callable: Callable accepting system prompt and payload.
+    Returns: None.
+    Error semantics: TypeError for integration misuse; tools return JSON errors.
+    Use when: Role 4 has a provider adapter, or tests use a fake LLM.
+    Do not use when: Passing credentials or constructing a client per call.
+    Side effects: Replaces the callable used by later tool calls.
+    Safety: Stores only the callable and never logs credentials.
+    Example: configure_tool_llm(call_structured_llm)
     """
+    if not callable(llm_callable): raise TypeError("llm_callable must be callable")
     global _TOOL_LLM
-    if llm_callable is not None and not callable(llm_callable):
-        raise TypeError("llm_callable phải là callable hoặc None.")
-    _TOOL_LLM = llm_callable
+    _TOOL_LLM=llm_callable
 
+def _json(data: dict[str,Any])->str: return json.dumps(data,ensure_ascii=False)
+def _error(code:str,message:str,*,field:str|None=None,retryable:bool=False)->str:
+    detail={"code":code,"message":message,"retryable":retryable}
+    if field is not None: detail["field"]=field
+    return _json({"ok":False,"error":detail})
+def _safe(exc:ToolFailure)->str: return _error(exc.code,exc.message,field=exc.field,retryable=exc.retryable)
 
-# =============================================================================
-# COMMON HELPERS
-# =============================================================================
+def _api_failure(exc:Exception)->ToolFailure:
+    text=f"{exc.__class__.__name__} {exc}".casefold()
+    if any(x in text for x in ("auth","unauthorized","forbidden","401")): return ToolFailure("API_AUTHENTICATION_ERROR","Không thể xác thực dịch vụ LLM. Hãy kiểm tra cấu hình máy chủ.")
+    if any(x in text for x in ("rate","429","quota")): return ToolFailure("API_RATE_LIMIT","Dịch vụ LLM đang giới hạn tần suất.",retryable=True)
+    if "timeout" in text or "timed out" in text: return ToolFailure("API_TIMEOUT","Dịch vụ LLM phản hồi quá thời gian.",retryable=True)
+    return ToolFailure("API_REQUEST_FAILED","Không thể hoàn tất yêu cầu tới dịch vụ LLM.")
 
-def _json_response(data: Mapping[str, Any]) -> str:
-    """Serialize một mapping thành JSON string giữ nguyên tiếng Việt."""
-    return json.dumps(dict(data), ensure_ascii=False)
+def _call_tool_llm(system_prompt:str,payload:dict[str,Any])->dict[str,Any]:
+    if _TOOL_LLM is None: raise ToolFailure("TOOL_LLM_NOT_CONFIGURED","Structured LLM cho tools chưa được cấu hình.")
+    for attempt in range(2):
+        try:
+            raw:Any=_TOOL_LLM(system_prompt,payload)
+            if isinstance(raw,str):
+                try: raw=json.loads(raw)
+                except json.JSONDecodeError as exc: raise ToolFailure("INVALID_JSON_RESPONSE","LLM trả về JSON không hợp lệ.") from exc
+            if not isinstance(raw,dict): raise ToolFailure("INVALID_LLM_RESPONSE","LLM phải trả về một JSON object.")
+            return raw
+        except ToolFailure: raise
+        except Exception as exc:
+            failure=_api_failure(exc)
+            if failure.retryable and attempt==0: time.sleep(.05); continue
+            raise failure from exc
+    raise ToolFailure("API_REQUEST_FAILED","Không thể gọi dịch vụ LLM.")
 
+def _parse_dict(value:Any,field:str,wrapper:str|None=None)->dict[str,Any]:
+    if isinstance(value,str):
+        try: value=json.loads(value)
+        except json.JSONDecodeError as exc: raise ToolFailure("INVALID_JSON_RESPONSE",f"{field} không phải JSON hợp lệ.",field=field) from exc
+    if not isinstance(value,dict): raise ToolFailure("INVALID_LLM_RESPONSE",f"{field} phải là JSON object.",field=field)
+    return value[wrapper] if wrapper and isinstance(value.get(wrapper),dict) else value
 
-def _success_response(**payload: Any) -> str:
-    """Tạo JSON success thống nhất cho Observation."""
-    return _json_response({"ok": True, **payload})
+def _parse_candidates(value:Any)->list[dict[str,Any]]:
+    if isinstance(value,str):
+        try: value=json.loads(value)
+        except json.JSONDecodeError as exc: raise ToolFailure("INVALID_JSON_RESPONSE","gift_candidates không phải JSON hợp lệ.",field="gift_candidates") from exc
+    if isinstance(value,dict): value=value.get("ranked_candidates")
+    if not isinstance(value,list) or not value or not all(isinstance(x,dict) for x in value):
+        raise ToolFailure("INVALID_CANDIDATE_SCHEMA","gift_candidates phải là danh sách object không rỗng.",field="gift_candidates")
+    return value
 
+def _norm(value:str)->str: return " ".join(value.casefold().split())
+def _fold(value:str)->str:
+    value=unicodedata.normalize("NFD",_norm(value))
+    return "".join(c for c in value if unicodedata.category(c)!="Mn")
 
-def _error_response(
-    code: str,
-    message: str,
-    *,
-    field: str | None = None,
-    retryable: bool = False,
-) -> str:
-    """Tạo JSON error an toàn, không làm ReAct loop crash."""
-    error: JsonObject = {
-        "code": code,
-        "message": message,
-        "retryable": retryable,
-    }
-    if field is not None:
-        error["field"] = field
-    return _json_response({"ok": False, "error": error})
-
-
-def _normalize_text(value: Any) -> str:
-    """Chuẩn hóa chuỗi để so sánh nhưng vẫn giữ dấu tiếng Việt."""
-    if not isinstance(value, str):
-        return ""
-    return " ".join(value.strip().lower().split())
-
-
-def _slug_text(value: Any) -> str:
-    """Chuẩn hóa chuỗi không dấu, dùng phát hiện tên concept gần trùng."""
-    normalized = unicodedata.normalize("NFD", _normalize_text(value))
-    ascii_text = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
-    return re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
-
-
-def _unique_strings(value: Any, *, field: str, allow_empty: bool = True) -> list[str]:
-    """Validate và chuẩn hóa list[str], loại phần tử rỗng/trùng."""
-    if value is None and allow_empty:
-        return []
-    if not isinstance(value, list):
-        raise _ToolFailure(
-            "INVALID_SCHEMA",
-            f"{field} phải là danh sách chuỗi.",
-            field,
-            True,
-        )
-
-    result: list[str] = []
-    seen: set[str] = set()
+def _strings(value:Any,field:str)->list[str]:
+    if not isinstance(value,list): raise ToolFailure("INVALID_LLM_RESPONSE",f"{field} phải là list string.",field=field)
+    result:list[str]=[]; seen:set[str]=set()
     for item in value:
-        if not isinstance(item, str):
-            raise _ToolFailure(
-                "INVALID_SCHEMA",
-                f"Mỗi phần tử của {field} phải là chuỗi.",
-                field,
-                True,
-            )
-        normalized = _normalize_text(item)
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            result.append(normalized)
-
-    if not allow_empty and not result:
-        raise _ToolFailure(
-            "INVALID_SCHEMA",
-            f"{field} không được để trống.",
-            field,
-            True,
-        )
+        if not isinstance(item,str): raise ToolFailure("INVALID_LLM_RESPONSE",f"{field} chỉ được chứa string.",field=field)
+        clean=" ".join(item.split())
+        if clean and _norm(clean) not in seen: result.append(clean); seen.add(_norm(clean))
     return result
 
+def _nullable(value:Any,field:str)->str|None:
+    if value is None: return None
+    if not isinstance(value,str): raise ToolFailure("INVALID_LLM_RESPONSE",f"{field} phải là string hoặc null.",field=field)
+    return " ".join(value.split()) or None
 
-def _parse_mapping(value: Any, *, field: str) -> JsonObject:
-    """Nhận dictionary hoặc JSON string và trả dictionary độc lập."""
-    if isinstance(value, Mapping):
-        return deepcopy(dict(value))
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise _ToolFailure("INVALID_INPUT", f"{field} không được rỗng.", field, True)
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise _ToolFailure(
-                "INVALID_JSON_INPUT",
-                f"{field} không phải JSON hợp lệ.",
-                field,
-                True,
-            ) from exc
-        if isinstance(parsed, Mapping):
-            return deepcopy(dict(parsed))
-    raise _ToolFailure(
-        "INVALID_INPUT",
-        f"{field} phải là dictionary hoặc JSON object string.",
-        field,
-        True,
-    )
+def _positive(value:Any,field:str,maximum:int|None=None)->int|None:
+    if value is None: return None
+    if isinstance(value,bool) or not isinstance(value,int) or value<=0:
+        raise ToolFailure("INVALID_BUDGET" if field=="budget_vnd" else "INVALID_LLM_RESPONSE",f"{field} phải là integer dương hoặc null.",field=field)
+    if maximum is not None and value>maximum: raise ToolFailure("INVALID_LLM_RESPONSE",f"{field} vượt giới hạn.",field=field)
+    return value
 
+def _validate_profile(raw:dict[str,Any])->dict[str,Any]:
+    out={f:_strings(raw.get(f),f) for f in LIST_FIELDS}
+    out["relationship"]=_nullable(raw.get("relationship"),"relationship")
+    out["occasion"]=_nullable(raw.get("occasion"),"occasion")
+    out["age"]=_positive(raw.get("age"),"age",120)
+    out["budget_vnd"]=_positive(raw.get("budget_vnd"),"budget_vnd")
+    excluded={_norm(x) for x in out["exclusions"]}
+    out["interests"]=[x for x in out["interests"] if _norm(x) not in excluded]
+    return out
 
-def _parse_candidate_list(value: Any) -> list[JsonObject]:
-    """Đọc danh sách candidate hoặc wrapper ``ranked_candidates``."""
-    parsed: Any = value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise _ToolFailure(
-                "INVALID_JSON_INPUT",
-                "gift_candidates không phải JSON hợp lệ.",
-                "gift_candidates",
-                True,
-            ) from exc
-
-    if isinstance(parsed, Mapping):
-        parsed = parsed.get("ranked_candidates")
-    if not isinstance(parsed, list) or not parsed:
-        raise _ToolFailure(
-            "EMPTY_GIFT_CANDIDATES",
-            "gift_candidates phải là danh sách không rỗng.",
-            "gift_candidates",
-            True,
-        )
-
-    candidates: list[JsonObject] = []
-    for index, candidate in enumerate(parsed):
-        if not isinstance(candidate, Mapping):
-            raise _ToolFailure(
-                "INVALID_CANDIDATE_SCHEMA",
-                f"Candidate tại vị trí {index} phải là object.",
-                "gift_candidates",
-                True,
-            )
-        candidates.append(deepcopy(dict(candidate)))
-    return candidates
-
-
-def _unwrap_object(data: JsonObject, key: str) -> JsonObject:
-    """Lấy object con từ wrapper success nếu có."""
-    nested = data.get(key)
-    if isinstance(nested, Mapping):
-        return deepcopy(dict(nested))
-    data_field = data.get("data")
-    if isinstance(data_field, Mapping):
-        nested = data_field.get(key)
-        if isinstance(nested, Mapping):
-            return deepcopy(dict(nested))
-    return deepcopy(data)
-
-
-def _classify_provider_exception(exc: Exception) -> _ToolFailure:
-    """Ánh xạ exception SDK phổ biến thành error code không lộ bí mật."""
-    name = exc.__class__.__name__.lower()
-    message = str(exc).lower()
-
-    if isinstance(exc, TimeoutError) or "timeout" in name or "timed out" in message:
-        return _ToolFailure(
-            "API_TIMEOUT",
-            "Dịch vụ LLM phản hồi quá thời gian cho phép.",
-            retryable=True,
-        )
-    if "ratelimit" in name or "rate limit" in message or "resourceexhausted" in name:
-        return _ToolFailure(
-            "API_RATE_LIMIT",
-            "Dịch vụ LLM đang giới hạn tần suất yêu cầu.",
-            retryable=True,
-        )
-    if (
-        isinstance(exc, PermissionError)
-        or "authentication" in name
-        or "unauthorized" in message
-        or "api key" in message
-    ):
-        return _ToolFailure(
-            "API_AUTHENTICATION_ERROR",
-            "Không thể xác thực dịch vụ LLM. Hãy kiểm tra cấu hình API ở Role 4.",
-            retryable=False,
-        )
-    if isinstance(exc, ConnectionError) or "connection" in name:
-        return _ToolFailure(
-            "API_REQUEST_FAILED",
-            "Không thể kết nối tới dịch vụ LLM.",
-            retryable=True,
-        )
-    return _ToolFailure(
-        "API_REQUEST_FAILED",
-        "Dịch vụ LLM không hoàn thành yêu cầu.",
-        retryable=False,
-    )
-
-
-def _call_structured_llm(
-    *,
-    system_prompt: str,
-    payload: JsonObject,
-    response_schema: JsonObject,
-) -> JsonObject:
-    """Gọi adapter LLM với tối đa một retry cho lỗi tạm thời."""
-    if _TOOL_LLM is None:
-        raise _ToolFailure(
-            "TOOL_LLM_NOT_CONFIGURED",
-            "Structured LLM cho tools chưa được cấu hình.",
-            retryable=False,
-        )
-
-    last_failure: _ToolFailure | None = None
-    for attempt in range(_MAX_API_ATTEMPTS):
-        try:
-            raw = _TOOL_LLM(system_prompt, deepcopy(payload), deepcopy(response_schema))
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise _ToolFailure(
-                        "INVALID_JSON_RESPONSE",
-                        "LLM không trả về JSON hợp lệ.",
-                        retryable=True,
-                    ) from exc
-            if not isinstance(raw, Mapping):
-                raise _ToolFailure(
-                    "INVALID_LLM_RESPONSE",
-                    "LLM không trả về object đúng định dạng.",
-                    retryable=True,
-                )
-            return deepcopy(dict(raw))
-        except _ToolFailure as failure:
-            last_failure = failure
-        except Exception as exc:  # Boundary với SDK bên ngoài.
-            last_failure = _classify_provider_exception(exc)
-
-        if last_failure is None or not last_failure.retryable:
-            break
-        if attempt + 1 >= _MAX_API_ATTEMPTS:
-            break
-
-    assert last_failure is not None
-    raise last_failure
-
-
-def _run_public_tool(operation: Callable[[], str]) -> str:
-    """Boundary chung chuyển lỗi dự kiến thành JSON Observation."""
-    try:
-        return operation()
-    except _ToolFailure as failure:
-        return _error_response(
-            failure.code,
-            failure.message,
-            field=failure.field,
-            retryable=failure.retryable,
-        )
-    except Exception:
-        # Không đưa exception nội bộ hoặc secret của provider ra Observation.
-        return _error_response(
-            "SYSTEM_ERROR",
-            "Tool gặp lỗi nội bộ khi xử lý dữ liệu.",
-            retryable=False,
-        )
-
-
-# =============================================================================
-# PROFILE VALIDATION
-# =============================================================================
-
-def _validate_recipient_profile(value: Any) -> JsonObject:
-    """Validate và chuẩn hóa recipient profile mà không mutate input."""
-    wrapper = _parse_mapping(value, field="recipient_profile")
-    profile = _unwrap_object(wrapper, "recipient_profile")
-
-    traits = _unique_strings(profile.get("traits", []), field="traits")
-    interests = _unique_strings(profile.get("interests", []), field="interests")
-    preferences = _unique_strings(profile.get("preferences", []), field="preferences")
-    exclusions = _unique_strings(profile.get("exclusions", []), field="exclusions")
-
-    exclusion_set = set(exclusions)
-    interests = [item for item in interests if item not in exclusion_set]
-    preferences = [item for item in preferences if item not in exclusion_set]
-
-    relationship = profile.get("relationship")
-    if relationship is not None:
-        if not isinstance(relationship, str):
-            raise _ToolFailure(
-                "INVALID_SCHEMA",
-                "relationship phải là chuỗi hoặc null.",
-                "relationship",
-                True,
-            )
-        relationship = _normalize_text(relationship) or None
-
-    occasion = profile.get("occasion")
-    if occasion is not None:
-        if not isinstance(occasion, str):
-            raise _ToolFailure(
-                "INVALID_SCHEMA",
-                "occasion phải là chuỗi hoặc null.",
-                "occasion",
-                True,
-            )
-        occasion = _normalize_text(occasion) or None
-
-    age = profile.get("age")
-    if age is not None:
-        if isinstance(age, bool) or not isinstance(age, int) or not 1 <= age <= 120:
-            raise _ToolFailure(
-                "INVALID_AGE",
-                "age phải là số nguyên từ 1 đến 120 hoặc null.",
-                "age",
-                True,
-            )
-
-    budget = profile.get("budget_vnd")
-    if budget is not None:
-        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
-            raise _ToolFailure(
-                "INVALID_BUDGET",
-                "budget_vnd phải là số nguyên dương hoặc null.",
-                "budget_vnd",
-                True,
-            )
-
-    return {
-        "traits": traits,
-        "interests": interests,
-        "preferences": preferences,
-        "exclusions": exclusions,
-        "relationship": relationship,
-        "occasion": occasion,
-        "age": age,
-        "budget_vnd": budget,
-    }
-
-
-def _validate_profile_analysis(value: Any, profile: JsonObject) -> JsonObject:
-    """Validate analysis và khóa các constraint quan trọng bằng Python."""
-    wrapper = _parse_mapping(value, field="profile_analysis")
-    analysis = _unwrap_object(wrapper, "profile_analysis")
-
-    priority_interests = _unique_strings(
-        analysis.get("priority_interests", analysis.get("priority_tags", [])),
-        field="priority_interests",
-    )
-    preferred_styles = _unique_strings(
-        analysis.get("preferred_gift_styles", []),
-        field="preferred_gift_styles",
-    )
-    avoid_features = _unique_strings(
-        analysis.get("avoid_features", analysis.get("avoid_tags", [])),
-        field="avoid_features",
-    )
-    avoid_features = list(dict.fromkeys([*profile["exclusions"], *avoid_features]))
-
-    gift_goal = analysis.get("gift_goal", "")
-    if not isinstance(gift_goal, str):
-        raise _ToolFailure(
-            "INVALID_SCHEMA", "gift_goal phải là chuỗi.", "gift_goal", True
-        )
-    gift_goal = gift_goal.strip()
-
-    generation_guidelines = _unique_strings(
-        analysis.get("generation_guidelines", []),
-        field="generation_guidelines",
-    )
-    clarification_questions = _unique_strings(
-        analysis.get("clarification_questions", []),
-        field="clarification_questions",
-    )
-    analysis_notes = _unique_strings(
-        analysis.get("analysis_notes", []), field="analysis_notes"
-    )
-
-    needs_clarification = analysis.get("needs_clarification", False)
-    if not isinstance(needs_clarification, bool):
-        raise _ToolFailure(
-            "INVALID_SCHEMA",
-            "needs_clarification phải là boolean.",
-            "needs_clarification",
-            True,
-        )
-
-    budget = profile["budget_vnd"]
+def _validate_analysis(raw:dict[str,Any],profile:dict[str,Any])->dict[str,Any]:
+    out={f:_strings(raw.get(f),f) for f in ANALYSIS_LIST_FIELDS}
+    out["gift_goal"]=_nullable(raw.get("gift_goal"),"gift_goal") or ""
+    if not isinstance(raw.get("needs_clarification"),bool): raise ToolFailure("INVALID_LLM_RESPONSE","needs_clarification phải là boolean.",field="needs_clarification")
+    out["needs_clarification"]=raw["needs_clarification"]
+    strategy=raw.get("budget_strategy")
+    if not isinstance(strategy,dict): raise ToolFailure("INVALID_LLM_RESPONSE","budget_strategy phải là object.",field="budget_strategy")
+    low,high=strategy.get("minimum_vnd"),strategy.get("maximum_vnd")
+    for key,value in (("minimum_vnd",low),("maximum_vnd",high)):
+        if value is not None and (isinstance(value,bool) or not isinstance(value,int) or value<0):
+            raise ToolFailure("INVALID_LLM_RESPONSE",f"budget_strategy.{key} không hợp lệ.",field=f"budget_strategy.{key}")
+    if low is not None and high is not None and low>high: raise ToolFailure("INVALID_LLM_RESPONSE","Khoảng budget strategy không hợp lệ.",field="budget_strategy")
+    budget=profile.get("budget_vnd")
+    if budget is not None and high is not None: high=min(high,budget); low=min(low,high) if low is not None else None
+    out["budget_strategy"]={"minimum_vnd":low,"maximum_vnd":high}
+    known={_norm(x) for x in out["avoid_features"]}
+    for x in profile["exclusions"]:
+        if _norm(x) not in known: out["avoid_features"].append(x); known.add(_norm(x))
     if budget is None:
-        budget_strategy = {"minimum_vnd": None, "maximum_vnd": None}
-        needs_clarification = True
-        if "ngân sách tối đa cho món quà là bao nhiêu?" not in clarification_questions:
-            clarification_questions.append("ngân sách tối đa cho món quà là bao nhiêu?")
-    else:
-        budget_strategy = {
-            "minimum_vnd": int(budget * 0.55),
-            "maximum_vnd": budget,
-        }
-
+        out["needs_clarification"]=True
+        if not any("ngân sách" in _norm(q) for q in out["clarification_questions"]): out["clarification_questions"].append("Ngân sách tối đa là bao nhiêu VND?")
     if not profile["interests"]:
-        needs_clarification = True
-        question = "người nhận có sở thích cụ thể nào không?"
-        if question not in clarification_questions:
-            clarification_questions.append(question)
+        out["needs_clarification"]=True
+        if not any("sở thích" in _norm(q) for q in out["clarification_questions"]): out["clarification_questions"].append("Người nhận có sở thích cụ thể nào?")
+    return out
 
-    return {
-        "priority_interests": priority_interests,
-        "preferred_gift_styles": preferred_styles,
-        "avoid_features": avoid_features,
-        "gift_goal": gift_goal,
-        "budget_strategy": budget_strategy,
-        "generation_guidelines": generation_guidelines,
-        "needs_clarification": needs_clarification,
-        "clarification_questions": clarification_questions,
-        "analysis_notes": analysis_notes,
-    }
+def _candidate(raw:Any,budget:int,exclusions:list[str],names:list[str])->tuple[dict[str,Any]|None,str|None]:
+    if not isinstance(raw,dict): return None,"INVALID_CANDIDATE_SCHEMA"
+    expected={"name","concept","components","estimated_price_range_vnd","fit_tags","gift_styles","suitable_occasions","suitable_relationships","possible_risks"}
+    if set(raw)!=expected: return None,"INVALID_CANDIDATE_SCHEMA"
+    name,concept=raw.get("name"),raw.get("concept")
+    if not isinstance(name,str) or not name.strip() or not isinstance(concept,str) or not concept.strip(): return None,"INVALID_CANDIDATE_SCHEMA"
+    name,concept=" ".join(name.split())," ".join(concept.split())
+    forbidden={"brand","brand_name","shop","store","url","link","product_id"}
+    serialized=json.dumps(raw,ensure_ascii=False)
+    if forbidden.intersection(raw) or URL_RE.search(serialized) or SHOP_RE.search(serialized): return None,"INVALID_CANDIDATE_SCHEMA"
+    folded=_fold(name)
+    if any(SequenceMatcher(None,folded,old).ratio()>=.86 for old in names): return None,"DUPLICATE_CANDIDATE"
+    components=raw.get("components")
+    if not isinstance(components,list) or not components: return None,"INVALID_CANDIDATE_SCHEMA"
+    clean_components=[]
+    for c in components:
+        if not isinstance(c,dict) or set(c)!={"name","estimated_price_vnd"}: return None,"INVALID_CANDIDATE_SCHEMA"
+        cn,price=c.get("name"),c.get("estimated_price_vnd")
+        if not isinstance(cn,str) or not cn.strip() or isinstance(price,bool) or not isinstance(price,int) or price<0: return None,"INVALID_CANDIDATE_SCHEMA"
+        clean_components.append({"name":" ".join(cn.split()),"estimated_price_vnd":price})
+    pr=raw.get("estimated_price_range_vnd")
+    if not isinstance(pr,dict) or set(pr)!={"minimum","maximum"}: return None,"INVALID_CANDIDATE_SCHEMA"
+    low,high=pr.get("minimum"),pr.get("maximum")
+    if any(isinstance(x,bool) or not isinstance(x,int) or x<0 for x in (low,high)) or low>high: return None,"INVALID_CANDIDATE_SCHEMA"
+    if high>budget: return None,"CANDIDATE_OVER_BUDGET"
+    try: lists={f:_strings(raw.get(f),f) for f in CANDIDATE_LIST_FIELDS}
+    except ToolFailure: return None,"INVALID_CANDIDATE_SCHEMA"
+    clean={"name":name,"concept":concept,"components":clean_components,"estimated_price_range_vnd":{"minimum":low,"maximum":high},**lists}
+    searchable=_fold(json.dumps(clean,ensure_ascii=False))
+    if any(_fold(x) and _fold(x) in searchable for x in exclusions): return None,"CANDIDATE_VIOLATES_EXCLUSION"
+    return clean,None
 
+def _matches(values:list[str],targets:list[str])->list[str]:
+    mapping={_norm(x):x for x in targets}
+    return list(dict.fromkeys(mapping[_norm(x)] for x in values if _norm(x) in mapping))
 
-# =============================================================================
-# TOOL PROMPTS AND SCHEMAS
-# =============================================================================
-_PROFILE_EXTRACTION_PROMPT = """
-Bạn là tool trích xuất hồ sơ người nhận quà cho một ReAct Agent.
-Chỉ lấy dữ kiện có trong mô tả; không chẩn đoán tâm lý và không tự điền thông
-tin thiếu. Chuẩn hóa tuổi thành integer, ngân sách thành integer VND. Điều kiện
-phủ định phải thắng sở thích tương ứng. Chỉ trả JSON đúng schema được cung cấp.
-""".strip()
+def _score(c:dict[str,Any],p:dict[str,Any],a:dict[str,Any])->tuple[int,dict[str,int],list[str]]:
+    interests=_matches(c["fit_tags"],p["interests"])
+    styles=_matches(c["gift_styles"],a["preferred_gift_styles"])
+    preferences=_matches(c["fit_tags"]+c["gift_styles"],p["preferences"])
+    personal=3 if "ca nhan hoa" in _fold(" ".join([c["name"],c["concept"]]+c["fit_tags"]+c["gift_styles"])) else 0
+    occasion=2 if p["occasion"] and _matches(c["suitable_occasions"],[p["occasion"]]) else 0
+    relationship=2 if p["relationship"] and _matches(c["suitable_relationships"],[p["relationship"]]) else 0
+    strategy=a["budget_strategy"]; low,high=strategy["minimum_vnd"],strategy["maximum_vnd"]; pr=c["estimated_price_range_vnd"]
+    strategy_points=2 if low is not None and high is not None and pr["minimum"]>=low and pr["maximum"]<=high else 0
+    breakdown={"interest_match":len(interests)*5,"preferred_gift_style_match":len(styles)*3,"preference_match":len(preferences)*3,"personalization_bonus":personal,"occasion_match":occasion,"relationship_match":relationship,"within_budget":2,"within_budget_strategy":strategy_points,"risk_penalty":-len(c["possible_risks"])}
+    signals=list(dict.fromkeys(interests+styles+preferences))
+    if personal: signals.append("cá nhân hóa")
+    if occasion: signals.append(p["occasion"])
+    if relationship: signals.append(p["relationship"])
+    return sum(breakdown.values()),breakdown,signals
 
-_PROFILE_ANALYSIS_PROMPT = """
-Bạn là tool tạo brief chọn quà từ recipient_profile đã có cấu trúc. Tạo insight
-có căn cứ, không chẩn đoán tâm lý, không sinh sản phẩm và không thêm sở thích
-không được hỗ trợ bởi hồ sơ. Exclusions phải xuất hiện trong avoid_features.
-Chỉ trả JSON đúng schema được cung cấp.
-""".strip()
+EXTRACT_PROMPT="Chỉ trích xuất dữ kiện đã nêu. Không suy diễn, chẩn đoán hay gợi ý quà. Trả JSON đúng schema profile; tuổi integer, ngân sách integer VND, thiếu dùng null/list rỗng; exclusion thắng interest."
+ANALYZE_PROMPT="Tạo brief từ profile, không catalog/candidate/chẩn đoán/thêm sở thích. Trả JSON đúng schema analysis. Exclusions nằm trong avoid_features; thiếu ngân sách hoặc sở thích thì needs_clarification=true."
+GENERATE_PROMPT="Sinh requested_count concept quà mới khác nhau từ profile và analysis, không catalog, brand, shop, URL, tồn kho, yếu tố nhạy cảm hay giá chính xác. Khoảng giá ước tính không vượt budget, không exclusion. Không score/rank/ID. Trả JSON {candidates:[{name,concept,components,estimated_price_range_vnd,fit_tags,gift_styles,suitable_occasions,suitable_relationships,possible_risks}]}."
+EXPLAIN_PROMPT="Chỉ giải thích candidate khóa; không sinh mới hay đổi ID, rank, name, components, giá, score; không link. Trả JSON {explanations:[{candidate_id,reason,why_it_fits,personalization_tip,verify_before_buying,budget_note}]}."
 
-_GIFT_GENERATION_PROMPT = """
-Bạn là tool sáng tạo concept quà tặng. Hãy sinh các concept khác nhau đáng kể,
-có thể là món đơn hoặc gift bundle, dựa đúng recipient_profile và
-profile_analysis. Không dùng catalog cố định, không tạo tên shop, thương hiệu,
-URL hoặc tuyên bố tồn kho. Giá chỉ là ước tính. Không tạo concept vượt ngân sách
-hoặc vi phạm exclusions/avoid_features. Không tự gán score, rank hay candidate_id;
-Python sẽ validate và thực hiện các bước đó. Chỉ trả JSON đúng schema.
-""".strip()
+def extract_recipient_profile(user_description:str)->str:
+    """Extract an evidence-only recipient profile with a structured LLM.
 
-_EXPLANATION_PROMPT = """
-Bạn là tool giải thích các concept quà đã được Python khóa và xếp hạng. Chỉ tạo
-reason, why_it_fits, personalization_tip, verify_before_buying và budget_note.
-Không đổi candidate_id, rank, name, components, khoảng giá hoặc score; không
-thêm candidate, sản phẩm, thương hiệu hay URL. Chỉ trả JSON đúng schema.
-""".strip()
-
-PROFILE_EXTRACTION_SCHEMA: JsonObject = {
-    "type": "object",
-    "properties": {
-        "traits": {"type": "array", "items": {"type": "string"}},
-        "interests": {"type": "array", "items": {"type": "string"}},
-        "preferences": {"type": "array", "items": {"type": "string"}},
-        "exclusions": {"type": "array", "items": {"type": "string"}},
-        "relationship": {"type": ["string", "null"]},
-        "occasion": {"type": ["string", "null"]},
-        "age": {"type": ["integer", "null"]},
-        "budget_vnd": {"type": ["integer", "null"]},
-    },
-    "required": [
-        "traits",
-        "interests",
-        "preferences",
-        "exclusions",
-        "relationship",
-        "occasion",
-        "age",
-        "budget_vnd",
-    ],
-    "additionalProperties": False,
-}
-
-PROFILE_ANALYSIS_SCHEMA: JsonObject = {
-    "type": "object",
-    "properties": {
-        "priority_interests": {"type": "array", "items": {"type": "string"}},
-        "preferred_gift_styles": {"type": "array", "items": {"type": "string"}},
-        "avoid_features": {"type": "array", "items": {"type": "string"}},
-        "gift_goal": {"type": "string"},
-        "generation_guidelines": {"type": "array", "items": {"type": "string"}},
-        "needs_clarification": {"type": "boolean"},
-        "clarification_questions": {"type": "array", "items": {"type": "string"}},
-        "analysis_notes": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "priority_interests",
-        "preferred_gift_styles",
-        "avoid_features",
-        "gift_goal",
-        "generation_guidelines",
-        "needs_clarification",
-        "clarification_questions",
-        "analysis_notes",
-    ],
-    "additionalProperties": False,
-}
-
-_GENERATED_CANDIDATE_SCHEMA: JsonObject = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "concept": {"type": "string"},
-        "components": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "estimated_price_vnd": {"type": "integer"},
-                },
-                "required": ["name", "estimated_price_vnd"],
-                "additionalProperties": False,
-            },
-        },
-        "estimated_price_range_vnd": {
-            "type": "object",
-            "properties": {
-                "minimum": {"type": "integer"},
-                "maximum": {"type": "integer"},
-            },
-            "required": ["minimum", "maximum"],
-            "additionalProperties": False,
-        },
-        "fit_tags": {"type": "array", "items": {"type": "string"}},
-        "gift_styles": {"type": "array", "items": {"type": "string"}},
-        "suitable_occasions": {"type": "array", "items": {"type": "string"}},
-        "suitable_relationships": {"type": "array", "items": {"type": "string"}},
-        "possible_risks": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "name",
-        "concept",
-        "components",
-        "estimated_price_range_vnd",
-        "fit_tags",
-        "gift_styles",
-        "suitable_occasions",
-        "suitable_relationships",
-        "possible_risks",
-    ],
-    "additionalProperties": False,
-}
-
-GIFT_GENERATION_SCHEMA: JsonObject = {
-    "type": "object",
-    "properties": {
-        "candidates": {
-            "type": "array",
-            "items": _GENERATED_CANDIDATE_SCHEMA,
-        }
-    },
-    "required": ["candidates"],
-    "additionalProperties": False,
-}
-
-EXPLANATION_SCHEMA: JsonObject = {
-    "type": "object",
-    "properties": {
-        "explanations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "candidate_id": {"type": "string"},
-                    "reason": {"type": "string"},
-                    "why_it_fits": {"type": "array", "items": {"type": "string"}},
-                    "personalization_tip": {"type": "string"},
-                    "verify_before_buying": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "budget_note": {"type": "string"},
-                },
-                "required": [
-                    "candidate_id",
-                    "reason",
-                    "why_it_fits",
-                    "personalization_tip",
-                    "verify_before_buying",
-                    "budget_note",
-                ],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["explanations"],
-    "additionalProperties": False,
-}
-
-
-# =============================================================================
-# TOOL 1
-# =============================================================================
-
-def extract_recipient_profile(user_description: str) -> str:
-    """Trích xuất mô tả tự do thành recipient profile có cấu trúc.
-
-    Role in pipeline:
-        Tool 1/4, gọi đầu tiên.
-
-    Args:
-        user_description: Mô tả người nhận, dịp tặng và ngân sách.
-
-    Returns:
-        JSON string chứa ``recipient_profile``, ``missing_fields`` và nguồn dữ
-        liệu; hoặc structured error.
-
-    Error semantics:
-        Trả JSON error khi input rỗng, LLM chưa cấu hình, API lỗi hoặc structured
-        output không hợp lệ. Không làm ReAct loop crash.
-
-    Use when:
-        Người dùng cung cấp mô tả bằng ngôn ngữ tự nhiên.
-
-    Do not use when:
-        Đã có recipient profile hợp lệ hoặc cần sinh quà.
-
-    Side effects:
-        Gọi LLM thông qua adapter đã cấu hình.
-
-    Safety:
-        Python validate lại output; exclusion thắng interest và không tự đoán
-        dữ kiện còn thiếu.
+    Summary: Convert natural language to the fixed profile schema.
+    Role in pipeline: Tool 1/4; recipient_profile feeds Tool 2.
+    Args: user_description: Non-empty user description.
+    Returns: JSON string with ok, profile, missing_fields and source.
+    Error semantics: Input, provider and LLM errors become ok:false JSON.
+    Use when: Starting the gift pipeline from raw text.
+    Do not use when: Inferring facts, diagnosing personality or suggesting gifts.
+    Side effects: Calls the injected LLM/API; does not read API keys.
+    Safety: LLM output may be imperfect; Python validates fields and exclusions.
+    Example: json.loads(extract_recipient_profile("Bạn thân thích sách"))
     """
+    if not isinstance(user_description,str) or not user_description.strip():
+        return _error("INVALID_INPUT","user_description phải là chuỗi không rỗng.",field="user_description",retryable=True)
+    try:
+        raw=_call_tool_llm(EXTRACT_PROMPT,{"_operation":"extract_recipient_profile","user_description":user_description.strip()})
+        profile=_validate_profile(raw.get("recipient_profile",raw))
+        missing=[f for f in PROFILE_FIELDS if profile[f] is None or profile[f]==[]]
+        return _json({"ok":True,"recipient_profile":profile,"missing_fields":missing,"source":"llm_structured_extraction"})
+    except ToolFailure as exc: return _safe(exc)
 
-    def operation() -> str:
-        if not isinstance(user_description, str) or not user_description.strip():
-            raise _ToolFailure(
-                "INVALID_INPUT",
-                "user_description phải là chuỗi không rỗng.",
-                "user_description",
-                True,
-            )
+AVAILABLE_TOOLS: dict[str, Callable[..., str]] = {}
+TOOL_CONTRACTS={
+ "extract_recipient_profile":{"input":{"user_description":"str"},"output":"JSON string: {ok,recipient_profile,missing_fields,source}"},
+ "analyze_recipient_profile":{"input":{"recipient_profile":"dict | JSON string"},"output":"JSON string: {ok,profile_analysis,source}"},
+ "generate_gift_candidates":{"input":{"recipient_profile":"dict | JSON string","profile_analysis":"dict | JSON string","max_candidates":"int 1..50"},"output":"JSON string: {ok,ranked_candidates,generation_summary}"},
+ "explain_recommendations":{"input":{"recipient_profile":"dict | JSON string","profile_analysis":"dict | JSON string","gift_candidates":"list | JSON string","top_k":"int 1..50"},"output":"JSON string: {ok,recommendations,explanation_note}"}}
 
-        raw_profile = _call_structured_llm(
-            system_prompt=_PROFILE_EXTRACTION_PROMPT,
-            payload={"user_description": user_description.strip()},
-            response_schema=PROFILE_EXTRACTION_SCHEMA,
-        )
-        profile = _validate_recipient_profile(raw_profile)
+def _arr()->dict[str,Any]: return {"type":"array","items":{"type":"string"}}
+PROFILE_SCHEMA={"type":"object","properties":{
+ "traits":_arr(),"interests":_arr(),"preferences":_arr(),"exclusions":_arr(),
+ "relationship":{"type":["string","null"]},"occasion":{"type":["string","null"]},
+ "age":{"type":["integer","null"],"minimum":1,"maximum":120},
+ "budget_vnd":{"type":["integer","null"],"minimum":1}},
+ "required":list(PROFILE_FIELDS),"additionalProperties":False}
+ANALYSIS_SCHEMA={"type":"object","properties":{
+ "priority_interests":_arr(),"preferred_gift_styles":_arr(),"avoid_features":_arr(),
+ "gift_goal":{"type":"string"},"budget_strategy":{"type":"object","properties":{
+  "minimum_vnd":{"type":["integer","null"],"minimum":0},
+  "maximum_vnd":{"type":["integer","null"],"minimum":0}},
+  "required":["minimum_vnd","maximum_vnd"],"additionalProperties":False},
+ "generation_guidelines":_arr(),"needs_clarification":{"type":"boolean"},
+ "clarification_questions":_arr(),"analysis_notes":_arr()},
+ "required":["priority_interests","preferred_gift_styles","avoid_features","gift_goal","budget_strategy","generation_guidelines","needs_clarification","clarification_questions","analysis_notes"],"additionalProperties":False}
+COMPONENT_SCHEMA={"type":"object","properties":{"name":{"type":"string"},"estimated_price_vnd":{"type":"integer","minimum":0}},"required":["name","estimated_price_vnd"],"additionalProperties":False}
+CANDIDATE_SCHEMA={"type":"object","properties":{
+ "rank":{"type":"integer","minimum":1},"candidate_id":{"type":"string"},"name":{"type":"string"},"concept":{"type":"string"},
+ "components":{"type":"array","items":COMPONENT_SCHEMA,"minItems":1},
+ "estimated_price_range_vnd":{"type":"object","properties":{"minimum":{"type":"integer","minimum":0},"maximum":{"type":"integer","minimum":0}},"required":["minimum","maximum"],"additionalProperties":False},
+ "fit_tags":_arr(),"gift_styles":_arr(),"suitable_occasions":_arr(),"suitable_relationships":_arr(),
+ "score":{"type":"integer"},"score_breakdown":{"type":"object","properties":{
+  "interest_match":{"type":"integer"},"preferred_gift_style_match":{"type":"integer"},
+  "preference_match":{"type":"integer"},"personalization_bonus":{"type":"integer"},
+  "occasion_match":{"type":"integer"},"relationship_match":{"type":"integer"},
+  "within_budget":{"type":"integer"},"within_budget_strategy":{"type":"integer"},
+  "risk_penalty":{"type":"integer"}},
+  "required":["interest_match","preferred_gift_style_match","preference_match","personalization_bonus","occasion_match","relationship_match","within_budget","within_budget_strategy","risk_penalty"],"additionalProperties":False},
+ "matched_signals":_arr(),"possible_risks":_arr(),
+ "data_source":{"type":"string"},"requires_market_verification":{"type":"boolean"}},
+ "required":["rank","candidate_id","name","concept","components","estimated_price_range_vnd","fit_tags","gift_styles","suitable_occasions","suitable_relationships","score","score_breakdown","matched_signals","possible_risks","data_source","requires_market_verification"],"additionalProperties":False}
 
-        missing_fields: list[str] = []
-        if not profile["interests"]:
-            missing_fields.append("interests")
-        if profile["budget_vnd"] is None:
-            missing_fields.append("budget_vnd")
-        if profile["relationship"] is None:
-            missing_fields.append("relationship")
-        if profile["occasion"] is None:
-            missing_fields.append("occasion")
+TOOL_SPECS=[
+ {"name":"extract_recipient_profile","description":"Tool 1/4: structured LLM chỉ trích xuất dữ kiện đã nêu; không suy diễn, chẩn đoán hoặc gợi ý quà.","parameters":{"type":"object","properties":{"user_description":{"type":"string","minLength":1}},"required":["user_description"],"additionalProperties":False}},
+ {"name":"analyze_recipient_profile","description":"Tool 2/4: structured LLM tạo brief từ profile; không catalog, candidate hoặc thêm sở thích.","parameters":{"type":"object","properties":{"recipient_profile":PROFILE_SCHEMA},"required":["recipient_profile"],"additionalProperties":False}},
+ {"name":"generate_gift_candidates","description":"Tool 3/4 dùng LLM để sinh các concept quà mới dựa trên hồ sơ và profile analysis; Python kiểm tra ngân sách, exclusions, schema, sau đó chấm điểm và gán rank. Candidate là ý tưởng được sinh, không phải sản phẩm hoặc giá thị trường đã xác minh.","parameters":{"type":"object","properties":{"recipient_profile":PROFILE_SCHEMA,"profile_analysis":ANALYSIS_SCHEMA,"max_candidates":{"type":"integer","minimum":1,"maximum":50,"default":10}},"required":["recipient_profile","profile_analysis"],"additionalProperties":False}},
+ {"name":"explain_recommendations","description":"Tool 4/4 chỉ giải thích các candidate từ Tool 3. Không được thay đổi rank, candidate_id, components hoặc khoảng giá.","parameters":{"type":"object","properties":{"recipient_profile":PROFILE_SCHEMA,"profile_analysis":ANALYSIS_SCHEMA,"gift_candidates":{"type":"array","items":CANDIDATE_SCHEMA,"minItems":1},"top_k":{"type":"integer","minimum":1,"maximum":50,"default":5}},"required":["recipient_profile","profile_analysis","gift_candidates"],"additionalProperties":False}}]
 
-        return _success_response(
-            recipient_profile=profile,
-            missing_fields=missing_fields,
-            source="llm_structured_extraction",
-        )
+def _fake_candidate(name:str,tag:str,maximum:int,risks:list[str]|None=None)->dict[str,Any]:
+    return {"name":name,"concept":f"Concept {tag} cá nhân hóa.","components":[{"name":f"Thành phần {tag}","estimated_price_vnd":maximum-100_000}],"estimated_price_range_vnd":{"minimum":maximum-150_000,"maximum":maximum},"fit_tags":[tag,"cá nhân hóa"],"gift_styles":["ý nghĩa","cá nhân hóa"],"suitable_occasions":["sinh nhật"],"suitable_relationships":["bạn thân"],"possible_risks":risks or []}
 
-    return _run_public_tool(operation)
+def _fake_llm(_:str,payload:dict[str,Any])->dict[str,Any]:
+    op=payload["_operation"]
+    if op=="extract_recipient_profile":
+        text=_norm(payload["user_description"])
+        return {"traits":["sáng tạo"],"interests":["đọc sách","trà","đọc sách"],"preferences":["ý nghĩa"],"exclusions":["trà"],"relationship":"bạn thân","occasion":"sinh nhật","age":21,"budget_vnd":None if "không ngân sách" in text else 800_000}
+    if op=="analyze_recipient_profile":
+        p=payload["recipient_profile"]; budget=p["budget_vnd"]
+        return {"priority_interests":p["interests"],"preferred_gift_styles":["ý nghĩa","cá nhân hóa"],"avoid_features":[],"gift_goal":"Quà dựa trên sở thích.","budget_strategy":{"minimum_vnd":int(budget*.5) if budget else None,"maximum_vnd":budget},"generation_guidelines":["Concept khác nhau"],"needs_clarification":budget is None or not p["interests"],"clarification_questions":[],"analysis_notes":[]}
+    if op=="generate_gift_candidates":
+        return {"candidates":[_fake_candidate("Không gian đọc sách cá nhân","đọc sách",700_000),_fake_candidate("Bộ sáng tạo ký ức","sáng tạo",600_000,["Xác nhận màu."]),_fake_candidate("Concept vượt ngân sách","đọc sách",900_000),_fake_candidate("Hộp trà thư giãn","trà",500_000)]}
+    if op=="explain_recommendations":
+        return {"explanations":[{"candidate_id":c["candidate_id"],"reason":"Phù hợp tín hiệu đã xác nhận.","why_it_fits":c["matched_signals"],"personalization_tip":"Thêm lời nhắn.","verify_before_buying":["Xác minh giá thực tế."],"budget_note":"Giá chỉ ước tính.","rank":999,"components":[],"estimated_price_range_vnd":{"minimum":1,"maximum":1}} for c in payload["gift_candidates"]]}
+    raise AssertionError("unknown operation")
 
+def _run_smoke_tests()->None:
+    """Run deterministic offline assertions and exit non-zero on failure."""
+    global _TOOL_LLM
+    passed=attempted=0
+    def check(condition:bool,label:str)->None:
+        nonlocal passed,attempted
+        attempted+=1
+        if condition: passed+=1; print(f"[PASS] {label}")
+        else: print(f"[FAIL] {label}")
+    _TOOL_LLM=None
+    check(json.loads(extract_recipient_profile("x"))["error"]["code"]=="TOOL_LLM_NOT_CONFIGURED","LLM chưa cấu hình")
+    configure_tool_llm(_fake_llm)
+    check(not json.loads(extract_recipient_profile(""))["ok"],"description rỗng")
+    check(not json.loads(extract_recipient_profile(7))["ok"],"description sai kiểu")  # type: ignore[arg-type]
+    extracted=json.loads(extract_recipient_profile("Bạn thân thích sách, 800k"))
+    check(extracted["ok"] and set(extracted["recipient_profile"])==set(PROFILE_FIELDS),"structured extraction")
+    exclusion=json.loads(extract_recipient_profile("Từng thích trà nhưng hiện không uống trà"))
+    check("trà" not in exclusion["recipient_profile"]["interests"],"exclusion thắng interest")
+    missing=json.loads(extract_recipient_profile("không ngân sách"))
+    missing_analysis=json.loads(analyze_recipient_profile(missing["recipient_profile"]))
+    check(missing_analysis["profile_analysis"]["needs_clarification"],"thiếu ngân sách")
+    invalid={**extracted["recipient_profile"],"budget_vnd":-1}
+    check(json.loads(generate_gift_candidates(invalid,missing_analysis["profile_analysis"]))["error"]["code"]=="INVALID_BUDGET","ngân sách âm")
+    original=_TOOL_LLM
+    configure_tool_llm(lambda _s,_p:"not-json")  # type: ignore[arg-type,return-value]
+    check(json.loads(extract_recipient_profile("x"))["error"]["code"]=="INVALID_JSON_RESPONSE","invalid LLM JSON")
+    configure_tool_llm(lambda s,p:{"candidates":[]} if p["_operation"]=="generate_gift_candidates" else _fake_llm(s,p))
+    check(json.loads(generate_gift_candidates(extracted["recipient_profile"],missing_analysis["profile_analysis"]))["error"]["code"]=="EMPTY_GENERATION","empty generation")
+    configure_tool_llm(original)  # type: ignore[arg-type]
+    analysis=json.loads(analyze_recipient_profile(extracted["recipient_profile"]))
+    generated=json.loads(generate_gift_candidates(extracted["recipient_profile"],analysis["profile_analysis"]))
+    candidates=generated["ranked_candidates"]; rejected={x["code"] for x in generated["generation_summary"]["rejected_candidates"]}
+    check("CANDIDATE_OVER_BUDGET" in rejected,"over budget rejected")
+    check("CANDIDATE_VIOLATES_EXCLUSION" in rejected,"exclusion rejected")
+    check({x["candidate_id"] for x in candidates}=={"C001","C002"},"C001/C002 assigned")
+    check(all(isinstance(x["score"],int) for x in candidates),"score exists")
+    check(all(x["score_breakdown"] for x in candidates),"breakdown exists")
+    check([x["rank"] for x in candidates]==list(range(1,len(candidates)+1)),"continuous ranks")
+    check([x["score"] for x in candidates]==sorted((x["score"] for x in candidates),reverse=True),"score descending")
+    explained=json.loads(explain_recommendations(extracted["recipient_profile"],analysis["profile_analysis"],candidates,2)); recs=explained["recommendations"]
+    check([x["candidate_id"] for x in recs]==[x["candidate_id"] for x in candidates],"Tool 4 locks IDs")
+    check([x["rank"] for x in recs]==[x["rank"] for x in candidates],"Tool 4 locks ranks")
+    check(recs[0]["components"]==candidates[0]["components"],"Tool 4 locks components")
+    check(recs[0]["estimated_price_range_vnd"]==candidates[0]["estimated_price_range_vnd"],"Tool 4 locks prices")
+    check(json.loads(explain_recommendations(extracted["recipient_profile"],analysis["profile_analysis"],candidates,0))["error"]["code"]=="INVALID_TOP_K","invalid top_k")
+    check(all(isinstance(x,dict) for x in (extracted,analysis,generated,explained)),"outputs parse in app")
+    secret="sk-test-secret"
+    configure_tool_llm(lambda _s,_p:(_ for _ in ()).throw(RuntimeError(f"authentication failed {secret}")))
+    safe=extract_recipient_profile("x")
+    check(json.loads(safe)["error"]["code"]=="API_AUTHENTICATION_ERROR","API error mapped")
+    check(secret not in safe,"secret not exposed")
+    check(not any(k.startswith("GIFT_") for k in globals()),"no fixed catalog")
+    check(set(AVAILABLE_TOOLS)=={"extract_recipient_profile","analyze_recipient_profile","generate_gift_candidates","explain_recommendations"},"exactly four tools")
+    configure_tool_llm(_fake_llm)
+    print(f"Smoke tests: {passed}/{attempted} passed")
+    if passed!=attempted: raise SystemExit(1)
 
-# =============================================================================
-# TOOL 2
-# =============================================================================
+# Registry initialization and smoke-test entry point are deferred until all
+# four public functions have been defined.
 
-def analyze_recipient_profile(recipient_profile: JsonObject | str) -> str:
-    """Tạo brief/insight chọn quà từ recipient profile.
+def analyze_recipient_profile(recipient_profile:dict[str,Any]|str)->str:
+    """Build a validated gift-generation brief from a recipient profile.
 
-    Role in pipeline:
-        Tool 2/4, chỉ gọi sau Observation của Tool 1.
-
-    Args:
-        recipient_profile: Profile object hoặc JSON string từ Tool 1.
-
-    Returns:
-        JSON string chứa ``profile_analysis`` hoặc structured error.
-
-    Error semantics:
-        Validation Python từ chối profile sai schema hoặc ngân sách không hợp
-        lệ; lỗi API được chuyển thành Observation an toàn.
-
-    Use when:
-        Cần tạo chiến lược và guideline để sinh concept.
-
-    Do not use when:
-        Chưa có profile hoặc cần sản phẩm cụ thể.
-
-    Side effects:
-        Gọi LLM qua adapter.
-
-    Safety:
-        Không chẩn đoán tâm lý; Python buộc exclusions vào avoid_features và
-        tự khóa budget strategy.
+    Summary: Use structured LLM analysis bounded by known facts.
+    Role in pipeline: Tool 2/4; consumes Tool 1 and feeds Tool 3.
+    Args: recipient_profile: Profile dict, wrapped response, or JSON string.
+    Returns: JSON string with ok, profile_analysis and source.
+    Error semantics: Invalid inputs/LLM/API failures return structured errors.
+    Use when: A profile exists and generation guidance is needed.
+    Do not use when: Accessing catalogs, generating products, or adding traits.
+    Side effects: Calls the injected LLM/API; does not mutate input.
+    Safety: This is gift guidance, not diagnosis; Python enforces exclusions.
+    Example: analyze_recipient_profile(profile_result)
     """
+    try:
+        profile=_validate_profile(_parse_dict(recipient_profile,"recipient_profile","recipient_profile"))
+        raw=_call_tool_llm(ANALYZE_PROMPT,{"_operation":"analyze_recipient_profile","recipient_profile":profile})
+        analysis=_validate_analysis(raw.get("profile_analysis",raw),profile)
+        return _json({"ok":True,"profile_analysis":analysis,"source":"llm_structured_analysis"})
+    except ToolFailure as exc: return _safe(exc)
 
-    def operation() -> str:
-        profile = _validate_recipient_profile(recipient_profile)
-        raw_analysis = _call_structured_llm(
-            system_prompt=_PROFILE_ANALYSIS_PROMPT,
-            payload={"recipient_profile": profile},
-            response_schema=PROFILE_ANALYSIS_SCHEMA,
-        )
-        analysis = _validate_profile_analysis(raw_analysis, profile)
-        return _success_response(
-            profile_analysis=analysis,
-            source="llm_structured_analysis",
-        )
+def generate_gift_candidates(recipient_profile:dict[str,Any]|str,profile_analysis:dict[str,Any]|str,max_candidates:int=10)->str:
+    """Generate novel concepts, then validate, score and rank in Python.
 
-    return _run_public_tool(operation)
-
-
-# =============================================================================
-# TOOL 3 HELPERS
-# =============================================================================
-
-def _validate_component(value: Any, *, index: int) -> JsonObject:
-    """Validate một component trong concept quà."""
-    if not isinstance(value, Mapping):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            f"Component {index} phải là object.",
-            "components",
-            True,
-        )
-    name = value.get("name")
-    price = value.get("estimated_price_vnd")
-    if not isinstance(name, str) or not name.strip():
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            f"Component {index} thiếu name hợp lệ.",
-            "components",
-            True,
-        )
-    if isinstance(price, bool) or not isinstance(price, int) or price < 0:
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            f"Component {index} có estimated_price_vnd không hợp lệ.",
-            "components",
-            True,
-        )
-    return {"name": name.strip(), "estimated_price_vnd": price}
-
-
-def _validate_generated_candidate(value: Any) -> JsonObject:
-    """Validate schema một concept do LLM sinh."""
-    if not isinstance(value, Mapping):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "Candidate phải là object.",
-            retryable=True,
-        )
-
-    name = value.get("name")
-    concept = value.get("concept")
-    if not isinstance(name, str) or not name.strip():
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA", "Candidate thiếu name.", "name", True
-        )
-    if not isinstance(concept, str) or not concept.strip():
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA", "Candidate thiếu concept.", "concept", True
-        )
-
-    components_raw = value.get("components")
-    if not isinstance(components_raw, list) or not components_raw:
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "components phải là danh sách không rỗng.",
-            "components",
-            True,
-        )
-    components = [
-        _validate_component(component, index=index)
-        for index, component in enumerate(components_raw, start=1)
-    ]
-
-    price_range = value.get("estimated_price_range_vnd")
-    if not isinstance(price_range, Mapping):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "estimated_price_range_vnd phải là object.",
-            "estimated_price_range_vnd",
-            True,
-        )
-    minimum = price_range.get("minimum")
-    maximum = price_range.get("maximum")
-    if (
-        isinstance(minimum, bool)
-        or isinstance(maximum, bool)
-        or not isinstance(minimum, int)
-        or not isinstance(maximum, int)
-        or minimum < 0
-        or maximum <= 0
-        or minimum > maximum
-    ):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "Khoảng giá candidate không hợp lệ.",
-            "estimated_price_range_vnd",
-            True,
-        )
-
-    if re.search(r"https?://|www\.", f"{name} {concept}", flags=re.IGNORECASE):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "Candidate không được chứa URL.",
-            "concept",
-            True,
-        )
-
-    return {
-        "name": name.strip(),
-        "concept": concept.strip(),
-        "components": components,
-        "estimated_price_range_vnd": {"minimum": minimum, "maximum": maximum},
-        "fit_tags": _unique_strings(value.get("fit_tags", []), field="fit_tags"),
-        "gift_styles": _unique_strings(
-            value.get("gift_styles", []), field="gift_styles"
-        ),
-        "suitable_occasions": _unique_strings(
-            value.get("suitable_occasions", []), field="suitable_occasions"
-        ),
-        "suitable_relationships": _unique_strings(
-            value.get("suitable_relationships", []), field="suitable_relationships"
-        ),
-        "possible_risks": _unique_strings(
-            value.get("possible_risks", []), field="possible_risks"
-        ),
-    }
-
-
-def _candidate_violation(candidate: JsonObject, avoid_features: Sequence[str]) -> str | None:
-    """Trả feature vi phạm đầu tiên hoặc None."""
-    if not avoid_features:
-        return None
-    searchable_parts = [
-        candidate["name"],
-        candidate["concept"],
-        *candidate["fit_tags"],
-        *candidate["gift_styles"],
-        *(component["name"] for component in candidate["components"]),
-    ]
-    searchable = _normalize_text(" ".join(searchable_parts))
-    for feature in avoid_features:
-        normalized = _normalize_text(feature)
-        if normalized and normalized in searchable:
-            return feature
-    return None
-
-
-def _score_candidate(
-    candidate: JsonObject,
-    profile: JsonObject,
-    analysis: JsonObject,
-) -> tuple[int, JsonObject, list[str]]:
-    """Tính điểm deterministic cho một concept hợp lệ."""
-    fit_tags = set(candidate["fit_tags"])
-    styles = set(candidate["gift_styles"])
-    interests = set(profile["interests"])
-    preferences = set(profile["preferences"])
-    preferred_styles = set(analysis["preferred_gift_styles"])
-
-    matched_interests = sorted(fit_tags & interests)
-    matched_styles = sorted(styles & preferred_styles)
-    matched_preferences = sorted((fit_tags | styles) & preferences)
-
-    interest_points = len(matched_interests) * 5
-    style_points = len(matched_styles) * 3
-    preference_points = len(matched_preferences) * 3
-    personalization_points = 3 if "cá nhân hóa" in styles or "cá nhân hóa" in fit_tags else 0
-
-    occasion = profile.get("occasion")
-    occasion_points = (
-        2 if occasion and occasion in set(candidate["suitable_occasions"]) else 0
-    )
-    relationship = profile.get("relationship")
-    relationship_points = (
-        2
-        if relationship and relationship in set(candidate["suitable_relationships"])
-        else 0
-    )
-
-    maximum = candidate["estimated_price_range_vnd"]["maximum"]
-    budget = profile["budget_vnd"]
-    budget_points = 2 if isinstance(budget, int) and maximum <= budget else 0
-
-    strategy = analysis["budget_strategy"]
-    strategy_min = strategy.get("minimum_vnd")
-    strategy_max = strategy.get("maximum_vnd")
-    budget_strategy_points = (
-        2
-        if isinstance(strategy_min, int)
-        and isinstance(strategy_max, int)
-        and strategy_min <= maximum <= strategy_max
-        else 0
-    )
-
-    risk_penalty = -len(candidate["possible_risks"])
-    score = (
-        interest_points
-        + style_points
-        + preference_points
-        + personalization_points
-        + occasion_points
-        + relationship_points
-        + budget_points
-        + budget_strategy_points
-        + risk_penalty
-    )
-
-    breakdown = {
-        "interest_points": interest_points,
-        "preferred_style_points": style_points,
-        "preference_points": preference_points,
-        "personalization_points": personalization_points,
-        "occasion_points": occasion_points,
-        "relationship_points": relationship_points,
-        "budget_points": budget_points,
-        "budget_strategy_points": budget_strategy_points,
-        "risk_penalty": risk_penalty,
-    }
-    matched_signals = list(
-        dict.fromkeys([*matched_interests, *matched_styles, *matched_preferences])
-    )
-    return score, breakdown, matched_signals
-
-
-# =============================================================================
-# TOOL 3
-# =============================================================================
-
-def generate_gift_candidates(
-    recipient_profile: JsonObject | str,
-    profile_analysis: JsonObject | str,
-    max_candidates: int = 10,
-) -> str:
-    """Sinh concept quà bằng LLM, sau đó Python validate, score và rank.
-
-    Role in pipeline:
-        Tool 3/4, gọi sau Tool 1 và Tool 2. Tool này đã thực hiện ranking.
-
+    Summary: Ask the LLM for new concepts; no fixed product catalog exists.
+    Role in pipeline: Tool 3/4; consumes Tools 1-2 and feeds locked data to Tool 4.
     Args:
-        recipient_profile: Hồ sơ từ Tool 1.
-        profile_analysis: Brief từ Tool 2.
-        max_candidates: Số concept tối đa trả về, từ 1 đến 20.
-
-    Returns:
-        JSON string chứa ``ranked_candidates`` và ``generation_summary``.
-
-    Error semantics:
-        Trả structured error nếu thiếu ngân sách, API lỗi hoặc không còn concept
-        hợp lệ sau validation.
-
-    Use when:
-        Cần sinh các ý tưởng quà mới phù hợp hồ sơ.
-
-    Do not use when:
-        Chưa có profile/analysis hoặc muốn tìm sản phẩm và tồn kho thực tế.
-
-    Side effects:
-        Gọi LLM; không ghi file và không thay đổi input.
-
-    Safety:
-        Không dùng catalog cố định. Python loại concept vượt ngân sách, vi phạm
-        exclusion, sai schema, chứa URL hoặc trùng tên; Python tự score/rank.
+        recipient_profile: Tool 1 profile/response.
+        profile_analysis: Tool 2 analysis/response.
+        max_candidates: Requested/returned limit, 1-50.
+    Returns: JSON string with ranked_candidates and generation_summary.
+    Error semantics: Budget/schema/generation/API failures are structured JSON.
+    Use when: Profile, analysis and a positive budget are available.
+    Do not use when: Seeking verified products, stock, sellers, links or exact prices.
+    Side effects: Calls injected LLM; local validation/scoring are read-only.
+    Safety: Concepts/prices can be imperfect; Python rejects exclusions, excess
+        budget, URLs, shops and duplicates. Market verification remains required.
+    Example: generate_gift_candidates(profile, analysis, 5)
     """
+    if isinstance(max_candidates,bool) or not isinstance(max_candidates,int) or not 1<=max_candidates<=50:
+        return _error("INVALID_CANDIDATE_SCHEMA","max_candidates phải là integer 1-50.",field="max_candidates",retryable=True)
+    try:
+        profile=_validate_profile(_parse_dict(recipient_profile,"recipient_profile","recipient_profile"))
+        analysis=_validate_analysis(_parse_dict(profile_analysis,"profile_analysis","profile_analysis"),profile)
+        budget=profile["budget_vnd"]
+        if budget is None: raise ToolFailure("MISSING_BUDGET","Cần ngân sách trước khi sinh concept.",field="budget_vnd",retryable=True)
+        if isinstance(budget,bool) or not isinstance(budget,int) or budget<=0: raise ToolFailure("INVALID_BUDGET","budget_vnd phải là integer dương.",field="budget_vnd",retryable=True)
+        raw=_call_tool_llm(GENERATE_PROMPT,{"_operation":"generate_gift_candidates","recipient_profile":profile,"profile_analysis":analysis,"requested_count":max_candidates})
+        generated=raw.get("candidates")
+        if not isinstance(generated,list) or not generated: raise ToolFailure("EMPTY_GENERATION","LLM không sinh candidate nào.",retryable=True)
+        accepted=[]; names=[]; rejected=[]
+        for index,item in enumerate(generated,1):
+            clean,reason=_candidate(item,budget,profile["exclusions"],names)
+            if reason:
+                rejected.append({"generated_index":index,"name":item.get("name") if isinstance(item,dict) else None,"code":reason}); continue
+            assert clean is not None
+            names.append(_fold(clean["name"]))
+            candidate_id=f"C{len(accepted)+1:03d}"
+            score,breakdown,signals=_score(clean,profile,analysis)
+            accepted.append({"candidate_id":candidate_id,**clean,"score":score,"score_breakdown":breakdown,"matched_signals":signals,"data_source":"llm_generated_concept","requires_market_verification":True})
+        if not accepted: raise ToolFailure("NO_VALID_CANDIDATES","Không có candidate hợp lệ sau validation.",retryable=True)
+        accepted.sort(key=lambda x:(-x["score"],x["estimated_price_range_vnd"]["maximum"],x["candidate_id"]))
+        returned=accepted[:max_candidates]
+        for rank,item in enumerate(returned,1): item["rank"]=rank
+        return _json({"ok":True,"ranked_candidates":returned,"generation_summary":{"requested_count":max_candidates,"generated_count":len(generated),"valid_count":len(accepted),"returned_count":len(returned),"rejected_candidates":rejected}})
+    except ToolFailure as exc: return _safe(exc)
 
-    def operation() -> str:
-        if (
-            isinstance(max_candidates, bool)
-            or not isinstance(max_candidates, int)
-            or not 1 <= max_candidates <= 20
-        ):
-            raise _ToolFailure(
-                "INVALID_MAX_CANDIDATES",
-                "max_candidates phải là số nguyên từ 1 đến 20.",
-                "max_candidates",
-                True,
-            )
+def explain_recommendations(recipient_profile:dict[str,Any]|str,profile_analysis:dict[str,Any]|str,gift_candidates:list[dict[str,Any]]|str,top_k:int=5)->str:
+    """Explain locked ranked candidates without changing core data.
 
-        profile = _validate_recipient_profile(recipient_profile)
-        analysis = _validate_profile_analysis(profile_analysis, profile)
-        budget = profile["budget_vnd"]
-        if budget is None:
-            raise _ToolFailure(
-                "MISSING_BUDGET",
-                "Cần ngân sách trước khi sinh concept quà.",
-                "budget_vnd",
-                True,
-            )
-
-        requested_generation_count = min(20, max_candidates + 3)
-        raw_generation = _call_structured_llm(
-            system_prompt=_GIFT_GENERATION_PROMPT,
-            payload={
-                "recipient_profile": profile,
-                "profile_analysis": analysis,
-                "number_of_candidates": requested_generation_count,
-            },
-            response_schema=GIFT_GENERATION_SCHEMA,
-        )
-        raw_candidates = raw_generation.get("candidates")
-        if not isinstance(raw_candidates, list) or not raw_candidates:
-            raise _ToolFailure(
-                "EMPTY_GENERATION",
-                "LLM không sinh được candidate nào.",
-                retryable=True,
-            )
-
-        valid_candidates: list[JsonObject] = []
-        rejected: list[JsonObject] = []
-        seen_names: set[str] = set()
-        avoid_features = list(
-            dict.fromkeys([*profile["exclusions"], *analysis["avoid_features"]])
-        )
-
-        for index, raw_candidate in enumerate(raw_candidates, start=1):
-            fallback_name = (
-                raw_candidate.get("name", f"candidate_{index}")
-                if isinstance(raw_candidate, Mapping)
-                else f"candidate_{index}"
-            )
-            try:
-                candidate = _validate_generated_candidate(raw_candidate)
-            except _ToolFailure as failure:
-                rejected.append(
-                    {
-                        "candidate_name": fallback_name,
-                        "reason_code": failure.code,
-                        "reason": failure.message,
-                    }
-                )
-                continue
-
-            name_key = _slug_text(candidate["name"])
-            if not name_key or name_key in seen_names:
-                rejected.append(
-                    {
-                        "candidate_name": candidate["name"],
-                        "reason_code": "DUPLICATE_CANDIDATE",
-                        "reason": "Tên concept bị trùng hoặc quá giống concept trước đó.",
-                    }
-                )
-                continue
-            seen_names.add(name_key)
-
-            maximum = candidate["estimated_price_range_vnd"]["maximum"]
-            if maximum > budget:
-                rejected.append(
-                    {
-                        "candidate_name": candidate["name"],
-                        "reason_code": "CANDIDATE_OVER_BUDGET",
-                        "reason": "Khoảng giá tối đa vượt ngân sách.",
-                    }
-                )
-                continue
-
-            violation = _candidate_violation(candidate, avoid_features)
-            if violation is not None:
-                rejected.append(
-                    {
-                        "candidate_name": candidate["name"],
-                        "reason_code": "CANDIDATE_VIOLATES_EXCLUSION",
-                        "reason": f"Concept vi phạm điều cần tránh: {violation}.",
-                    }
-                )
-                continue
-
-            candidate_id = f"C{index:03d}"
-            score, breakdown, matched_signals = _score_candidate(
-                candidate, profile, analysis
-            )
-            valid_candidates.append(
-                {
-                    **candidate,
-                    "candidate_id": candidate_id,
-                    "score": score,
-                    "score_breakdown": breakdown,
-                    "matched_signals": matched_signals,
-                    "data_source": "llm_generated_concept",
-                    "requires_market_verification": True,
-                }
-            )
-
-        if not valid_candidates:
-            raise _ToolFailure(
-                "NO_VALID_CANDIDATES",
-                "Không còn concept hợp lệ sau kiểm tra ngân sách, exclusion và schema.",
-                retryable=True,
-            )
-
-        valid_candidates.sort(
-            key=lambda item: (
-                -item["score"],
-                item["estimated_price_range_vnd"]["maximum"],
-                item["candidate_id"],
-            )
-        )
-
-        ranked: list[JsonObject] = []
-        for rank, candidate in enumerate(valid_candidates[:max_candidates], start=1):
-            ranked.append({"rank": rank, **candidate})
-
-        return _success_response(
-            ranked_candidates=ranked,
-            generation_summary={
-                "requested_count": max_candidates,
-                "generation_requested_from_llm": requested_generation_count,
-                "generated_count": len(raw_candidates),
-                "valid_count": len(valid_candidates),
-                "returned_count": len(ranked),
-                "rejected_candidates": rejected,
-            },
-            generation_note=(
-                "Các candidate là concept do LLM sinh; giá chỉ là ước tính và "
-                "cần xác minh thị trường."
-            ),
-        )
-
-    return _run_public_tool(operation)
-
-
-# =============================================================================
-# TOOL 4
-# =============================================================================
-
-def _validate_locked_candidate(candidate: JsonObject) -> JsonObject:
-    """Validate các trường cốt lõi mà Tool 4 không được thay đổi."""
-    candidate_id = candidate.get("candidate_id")
-    rank = candidate.get("rank")
-    name = candidate.get("name")
-    if not isinstance(candidate_id, str) or not candidate_id.strip():
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "Candidate thiếu candidate_id.",
-            "candidate_id",
-            True,
-        )
-    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA", "Candidate có rank không hợp lệ.", "rank", True
-        )
-    if not isinstance(name, str) or not name.strip():
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA", "Candidate thiếu name.", "name", True
-        )
-
-    validated_generated = _validate_generated_candidate(candidate)
-    score = candidate.get("score")
-    if isinstance(score, bool) or not isinstance(score, int):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA", "Candidate thiếu score hợp lệ.", "score", True
-        )
-    score_breakdown = candidate.get("score_breakdown")
-    if not isinstance(score_breakdown, Mapping):
-        raise _ToolFailure(
-            "INVALID_CANDIDATE_SCHEMA",
-            "Candidate thiếu score_breakdown.",
-            "score_breakdown",
-            True,
-        )
-
-    return {
-        "rank": rank,
-        "candidate_id": candidate_id.strip(),
-        **validated_generated,
-        "score": score,
-        "score_breakdown": deepcopy(dict(score_breakdown)),
-        "matched_signals": _unique_strings(
-            candidate.get("matched_signals", []), field="matched_signals"
-        ),
-        "data_source": "llm_generated_concept",
-        "requires_market_verification": True,
-    }
-
-
-def _validate_explanation(value: Any) -> JsonObject:
-    """Validate phần giải thích được phép do LLM tạo."""
-    if not isinstance(value, Mapping):
-        raise _ToolFailure(
-            "INVALID_LLM_RESPONSE",
-            "Mỗi explanation phải là object.",
-            retryable=True,
-        )
-    candidate_id = value.get("candidate_id")
-    reason = value.get("reason")
-    personalization_tip = value.get("personalization_tip")
-    budget_note = value.get("budget_note")
-    if not isinstance(candidate_id, str) or not candidate_id.strip():
-        raise _ToolFailure(
-            "INVALID_LLM_RESPONSE", "Explanation thiếu candidate_id.", retryable=True
-        )
-    for field_name, field_value in (
-        ("reason", reason),
-        ("personalization_tip", personalization_tip),
-        ("budget_note", budget_note),
-    ):
-        if not isinstance(field_value, str) or not field_value.strip():
-            raise _ToolFailure(
-                "INVALID_LLM_RESPONSE",
-                f"Explanation thiếu {field_name} hợp lệ.",
-                field_name,
-                True,
-            )
-    return {
-        "candidate_id": candidate_id.strip(),
-        "reason": reason.strip(),
-        "why_it_fits": _unique_strings(
-            value.get("why_it_fits", []), field="why_it_fits"
-        ),
-        "personalization_tip": personalization_tip.strip(),
-        "verify_before_buying": _unique_strings(
-            value.get("verify_before_buying", []), field="verify_before_buying"
-        ),
-        "budget_note": budget_note.strip(),
-    }
-
-
-def explain_recommendations(
-    recipient_profile: JsonObject | str,
-    profile_analysis: JsonObject | str,
-    gift_candidates: list[JsonObject] | str | JsonObject,
-    top_k: int = 5,
-) -> str:
-    """Giải thích grounded cho candidate đã được Tool 3 xếp hạng.
-
-    Role in pipeline:
-        Tool 4/4, bước cuối trước Final Answer.
-
+    Summary: Generate grounded prose and merge it onto Tool 3 records.
+    Role in pipeline: Tool 4/4, after deterministic ranking.
     Args:
-        recipient_profile: Profile từ Tool 1.
-        profile_analysis: Brief từ Tool 2.
-        gift_candidates: ``ranked_candidates`` từ Tool 3 hoặc wrapper chứa nó.
-        top_k: Số candidate cần giải thích, từ 1 đến 20.
-
-    Returns:
-        JSON string chứa recommendations đã khóa dữ liệu cốt lõi.
-
-    Error semantics:
-        Trả structured error khi candidate/schema/top_k hoặc LLM response không
-        hợp lệ.
-
-    Use when:
-        Đã có candidate được Python score và rank.
-
-    Do not use when:
-        Muốn đổi ranking, components, khoảng giá hoặc sinh concept mới.
-
-    Side effects:
-        Gọi LLM qua adapter.
-
-    Safety:
-        Python merge explanation vào candidate gốc; mọi thay đổi rank, ID, giá,
-        components hoặc score do LLM đề xuất đều bị bỏ qua.
+        recipient_profile: Tool 1 profile/response.
+        profile_analysis: Tool 2 analysis/response.
+        gift_candidates: Tool 3 list/response.
+        top_k: Number of leading candidates, 1-50.
+    Returns: JSON string whose core fields come only from Tool 3.
+    Error semantics: Invalid input/explanations/API failures return JSON errors.
+    Use when: Ranked Tool 3 observations need user-facing reasons.
+    Do not use when: Generating, re-ranking, or changing price/components/IDs.
+    Side effects: Calls injected LLM; never buys, links or verifies products.
+    Safety: Explanations may be imperfect; Python locks core data. Estimated
+        prices and concepts require market verification before purchase.
+    Example: explain_recommendations(profile, analysis, ranked, 3)
     """
+    if isinstance(top_k,bool) or not isinstance(top_k,int) or not 1<=top_k<=50:
+        return _error("INVALID_TOP_K","top_k phải là integer 1-50.",field="top_k",retryable=True)
+    try:
+        profile=_validate_profile(_parse_dict(recipient_profile,"recipient_profile","recipient_profile"))
+        analysis=_validate_analysis(_parse_dict(profile_analysis,"profile_analysis","profile_analysis"),profile)
+        candidates=_parse_candidates(gift_candidates)[:top_k]; seen=set()
+        core=("rank","candidate_id","name","components","estimated_price_range_vnd","score")
+        for c in candidates:
+            cid=c.get("candidate_id")
+            if not isinstance(cid,str) or not cid: raise ToolFailure("INVALID_CANDIDATE_SCHEMA","Candidate thiếu candidate_id.",field="candidate_id")
+            if cid in seen: raise ToolFailure("DUPLICATE_CANDIDATE","candidate_id bị trùng.",field="candidate_id")
+            seen.add(cid)
+            if any(f not in c for f in core): raise ToolFailure("INVALID_CANDIDATE_SCHEMA","Candidate thiếu dữ liệu cốt lõi.")
+        raw=_call_tool_llm(EXPLAIN_PROMPT,{"_operation":"explain_recommendations","recipient_profile":profile,"profile_analysis":analysis,"gift_candidates":candidates})
+        explanations=raw.get("explanations")
+        if not isinstance(explanations,list): raise ToolFailure("INVALID_LLM_RESPONSE","LLM phải trả danh sách explanations.")
+        by_id={}
+        for e in explanations:
+            if not isinstance(e,dict): raise ToolFailure("INVALID_LLM_RESPONSE","Explanation phải là object.")
+            cid=e.get("candidate_id")
+            if not isinstance(cid,str) or cid not in seen or cid in by_id: raise ToolFailure("INVALID_LLM_RESPONSE","candidate_id explanation thiếu, lạ hoặc trùng.",field="candidate_id")
+            reason=_nullable(e.get("reason"),"reason"); tip=_nullable(e.get("personalization_tip"),"personalization_tip"); note=_nullable(e.get("budget_note"),"budget_note")
+            if not reason or not tip or not note: raise ToolFailure("INVALID_LLM_RESPONSE","Explanation thiếu nội dung.")
+            by_id[cid]={"reason":reason,"why_it_fits":_strings(e.get("why_it_fits"),"why_it_fits"),"personalization_tip":tip,"verify_before_buying":_strings(e.get("verify_before_buying"),"verify_before_buying"),"budget_note":note}
+        if set(by_id)!=seen: raise ToolFailure("INVALID_LLM_RESPONSE","LLM chưa giải thích đủ candidate.")
+        recommendations=[{"rank":c["rank"],"candidate_id":c["candidate_id"],"name":c["name"],"components":c["components"],"estimated_price_range_vnd":c["estimated_price_range_vnd"],"score":c["score"],**by_id[c["candidate_id"]],"requires_market_verification":True} for c in candidates]
+        return _json({"ok":True,"recommendations":recommendations,"explanation_note":"Thứ tự và dữ liệu cốt lõi được giữ nguyên từ generate_gift_candidates."})
+    except ToolFailure as exc: return _safe(exc)
 
-    def operation() -> str:
-        if (
-            isinstance(top_k, bool)
-            or not isinstance(top_k, int)
-            or not 1 <= top_k <= 20
-        ):
-            raise _ToolFailure(
-                "INVALID_TOP_K",
-                "top_k phải là số nguyên từ 1 đến 20.",
-                "top_k",
-                True,
-            )
-
-        profile = _validate_recipient_profile(recipient_profile)
-        analysis = _validate_profile_analysis(profile_analysis, profile)
-        raw_candidates = _parse_candidate_list(gift_candidates)
-        locked_candidates = [
-            _validate_locked_candidate(candidate) for candidate in raw_candidates[:top_k]
-        ]
-
-        seen_ids: set[str] = set()
-        for candidate in locked_candidates:
-            candidate_id = candidate["candidate_id"]
-            if candidate_id in seen_ids:
-                raise _ToolFailure(
-                    "DUPLICATE_CANDIDATE",
-                    f"candidate_id bị trùng: {candidate_id}.",
-                    "candidate_id",
-                    True,
-                )
-            seen_ids.add(candidate_id)
-
-        raw_explanations = _call_structured_llm(
-            system_prompt=_EXPLANATION_PROMPT,
-            payload={
-                "recipient_profile": profile,
-                "profile_analysis": analysis,
-                "locked_candidates": locked_candidates,
-            },
-            response_schema=EXPLANATION_SCHEMA,
-        )
-        explanations_raw = raw_explanations.get("explanations")
-        if not isinstance(explanations_raw, list) or not explanations_raw:
-            raise _ToolFailure(
-                "INVALID_LLM_RESPONSE",
-                "LLM không trả về danh sách explanations.",
-                retryable=True,
-            )
-
-        explanation_by_id: dict[str, JsonObject] = {}
-        for raw in explanations_raw:
-            explanation = _validate_explanation(raw)
-            candidate_id = explanation["candidate_id"]
-            if candidate_id in explanation_by_id:
-                raise _ToolFailure(
-                    "INVALID_LLM_RESPONSE",
-                    f"Explanation bị trùng candidate_id: {candidate_id}.",
-                    retryable=True,
-                )
-            explanation_by_id[candidate_id] = explanation
-
-        recommendations: list[JsonObject] = []
-        for candidate in locked_candidates:
-            candidate_id = candidate["candidate_id"]
-            explanation = explanation_by_id.get(candidate_id)
-            if explanation is None:
-                raise _ToolFailure(
-                    "INVALID_LLM_RESPONSE",
-                    f"Thiếu explanation cho {candidate_id}.",
-                    retryable=True,
-                )
-            recommendations.append(
-                {
-                    # Các trường khóa lấy từ Tool 3.
-                    "rank": candidate["rank"],
-                    "candidate_id": candidate_id,
-                    "name": candidate["name"],
-                    "concept": candidate["concept"],
-                    "components": candidate["components"],
-                    "estimated_price_range_vnd": candidate[
-                        "estimated_price_range_vnd"
-                    ],
-                    "score": candidate["score"],
-                    "matched_signals": candidate["matched_signals"],
-                    # Chỉ các trường dưới lấy từ LLM Tool 4.
-                    "reason": explanation["reason"],
-                    "why_it_fits": explanation["why_it_fits"],
-                    "personalization_tip": explanation["personalization_tip"],
-                    "verify_before_buying": explanation["verify_before_buying"],
-                    "budget_note": explanation["budget_note"],
-                    "data_source": "llm_generated_concept",
-                    "requires_market_verification": True,
-                }
-            )
-
-        return _success_response(
-            recommendations=recommendations,
-            explanation_note=(
-                "Thứ tự, ID, components, score và khoảng giá được giữ nguyên "
-                "từ generate_gift_candidates."
-            ),
-        )
-
-    return _run_public_tool(operation)
-
-
-# =============================================================================
-# REGISTRY AND SPECS
-# =============================================================================
-AVAILABLE_TOOLS: dict[str, Callable[..., str]] = {
+AVAILABLE_TOOLS = {
     "extract_recipient_profile": extract_recipient_profile,
     "analyze_recipient_profile": analyze_recipient_profile,
     "generate_gift_candidates": generate_gift_candidates,
     "explain_recommendations": explain_recommendations,
 }
-
-TOOL_CONTRACTS: dict[str, JsonObject] = {
-    "extract_recipient_profile": {
-        "step": 1,
-        "input": {"user_description": "str"},
-        "output": {"recipient_profile": "object", "missing_fields": "list[str]"},
-        "llm_role": "structured extraction",
-    },
-    "analyze_recipient_profile": {
-        "step": 2,
-        "input": {"recipient_profile": "object"},
-        "output": {"profile_analysis": "object"},
-        "llm_role": "structured analysis",
-    },
-    "generate_gift_candidates": {
-        "step": 3,
-        "input": {
-            "recipient_profile": "object",
-            "profile_analysis": "object",
-            "max_candidates": "int",
-        },
-        "output": {"ranked_candidates": "list", "generation_summary": "object"},
-        "llm_role": "creative concept generation",
-        "python_role": "validation, filtering, scoring and ranking",
-    },
-    "explain_recommendations": {
-        "step": 4,
-        "input": {
-            "recipient_profile": "object",
-            "profile_analysis": "object",
-            "gift_candidates": "list",
-            "top_k": "int",
-        },
-        "output": {"recommendations": "list"},
-        "llm_role": "grounded explanation only",
-    },
-}
-
-TOOL_SPECS: list[JsonObject] = [
-    {
-        "name": "extract_recipient_profile",
-        "description": (
-            "Tool 1/4. Gọi đầu tiên để dùng structured LLM trích xuất hồ sơ "
-            "từ mô tả tự nhiên. Không sinh quà và không tự đoán dữ kiện thiếu."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_description": {
-                    "type": "string",
-                    "description": "Mô tả tự nhiên về người nhận và yêu cầu tặng quà.",
-                }
-            },
-            "required": ["user_description"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "analyze_recipient_profile",
-        "description": (
-            "Tool 2/4. Chỉ gọi sau Tool 1 và truyền recipient_profile từ "
-            "Observation trước. Tạo brief sinh quà, không tạo candidate."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "recipient_profile": {
-                    "type": "object",
-                    "description": "recipient_profile từ Tool 1.",
-                }
-            },
-            "required": ["recipient_profile"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "generate_gift_candidates",
-        "description": (
-            "Tool 3/4. Dùng LLM sinh concept quà mới, không dùng catalog cố "
-            "định. Python kiểm tra schema/ngân sách/exclusions, tự gán ID, "
-            "score và rank. Giá là ước tính, không phải dữ liệu thị trường."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "recipient_profile": {
-                    "type": "object",
-                    "description": "recipient_profile từ Tool 1.",
-                },
-                "profile_analysis": {
-                    "type": "object",
-                    "description": "profile_analysis từ Tool 2.",
-                },
-                "max_candidates": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20,
-                    "default": 10,
-                },
-            },
-            "required": ["recipient_profile", "profile_analysis"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "explain_recommendations",
-        "description": (
-            "Tool 4/4. Chỉ giải thích ranked_candidates từ Tool 3. Python "
-            "khóa rank, candidate_id, components, score và khoảng giá; LLM "
-            "không được sửa hoặc thêm candidate."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "recipient_profile": {"type": "object"},
-                "profile_analysis": {"type": "object"},
-                "gift_candidates": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
-                "top_k": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20,
-                    "default": 5,
-                },
-            },
-            "required": ["recipient_profile", "profile_analysis", "gift_candidates"],
-            "additionalProperties": False,
-        },
-    },
-]
-
-
-# =============================================================================
-# DETERMINISTIC SMOKE TESTS (NO REAL API)
-# =============================================================================
-
-def _fake_structured_llm(
-    system_prompt: str,
-    payload: JsonObject,
-    response_schema: JsonObject,
-) -> JsonObject:
-    """Fake LLM cho test; không dùng mạng hoặc API token."""
-    del response_schema
-    if "trích xuất hồ sơ" in system_prompt:
-        text = _normalize_text(payload.get("user_description", ""))
-        exclusions = ["mùi hương"] if "không thích mùi hương" in text else []
-        interests = ["đọc sách", "trà"]
-        if "không uống trà" in text:
-            exclusions.append("trà")
-            interests = [item for item in interests if item != "trà"]
-        return {
-            "traits": ["hướng nội"],
-            "interests": interests,
-            "preferences": ["ý nghĩa", "cá nhân hóa"],
-            "exclusions": exclusions,
-            "relationship": "bạn thân",
-            "occasion": "sinh nhật",
-            "age": 21,
-            "budget_vnd": 800_000 if "không ngân sách" not in text else None,
-        }
-
-    if "tạo brief chọn quà" in system_prompt:
-        profile = payload["recipient_profile"]
-        return {
-            "priority_interests": profile["interests"],
-            "preferred_gift_styles": ["ý nghĩa", "cá nhân hóa", "thư giãn"],
-            "avoid_features": profile["exclusions"],
-            "gift_goal": "Tạo cảm giác được thấu hiểu qua sở thích cá nhân.",
-            "generation_guidelines": ["Kết hợp sở thích nổi bật."],
-            "needs_clarification": False,
-            "clarification_questions": [],
-            "analysis_notes": [],
-        }
-
-    if "sáng tạo concept quà tặng" in system_prompt:
-        return {
-            "candidates": [
-                {
-                    "name": "Bộ đọc sách và thưởng trà cá nhân hóa",
-                    "concept": "Kết hợp sách, trà, bookmark khắc tên và thiệp.",
-                    "components": [
-                        {"name": "Sách theo thể loại yêu thích", "estimated_price_vnd": 250000},
-                        {"name": "Hộp trà tuyển chọn", "estimated_price_vnd": 220000},
-                        {"name": "Bookmark cá nhân hóa", "estimated_price_vnd": 80000},
-                    ],
-                    "estimated_price_range_vnd": {"minimum": 500000, "maximum": 700000},
-                    "fit_tags": ["đọc sách", "trà", "cá nhân hóa", "ý nghĩa"],
-                    "gift_styles": ["cá nhân hóa", "ý nghĩa", "thư giãn"],
-                    "suitable_occasions": ["sinh nhật"],
-                    "suitable_relationships": ["bạn thân"],
-                    "possible_risks": ["Cần biết thể loại sách yêu thích."],
-                },
-                {
-                    "name": "Góc thư giãn đọc sách tối giản",
-                    "concept": "Đèn đọc sách, gối tựa và sổ ghi chú.",
-                    "components": [
-                        {"name": "Đèn đọc sách", "estimated_price_vnd": 300000},
-                        {"name": "Sổ ghi chú", "estimated_price_vnd": 90000},
-                    ],
-                    "estimated_price_range_vnd": {"minimum": 390000, "maximum": 520000},
-                    "fit_tags": ["đọc sách", "thư giãn"],
-                    "gift_styles": ["thư giãn", "thực dụng"],
-                    "suitable_occasions": ["sinh nhật"],
-                    "suitable_relationships": ["bạn thân"],
-                    "possible_risks": [],
-                },
-                {
-                    "name": "Concept vượt ngân sách",
-                    "concept": "Một concept test phải bị Python loại.",
-                    "components": [{"name": "Thiết bị đắt tiền", "estimated_price_vnd": 1200000}],
-                    "estimated_price_range_vnd": {"minimum": 1000000, "maximum": 1200000},
-                    "fit_tags": ["công nghệ"],
-                    "gift_styles": ["thực dụng"],
-                    "suitable_occasions": ["sinh nhật"],
-                    "suitable_relationships": ["bạn thân"],
-                    "possible_risks": [],
-                },
-                {
-                    "name": "Bộ nến mùi hương",
-                    "concept": "Concept phải bị loại nếu profile tránh mùi hương.",
-                    "components": [{"name": "Nến mùi hương", "estimated_price_vnd": 250000}],
-                    "estimated_price_range_vnd": {"minimum": 200000, "maximum": 300000},
-                    "fit_tags": ["mùi hương", "thư giãn"],
-                    "gift_styles": ["thư giãn"],
-                    "suitable_occasions": ["sinh nhật"],
-                    "suitable_relationships": ["bạn thân"],
-                    "possible_risks": [],
-                },
-            ]
-        }
-
-    if "giải thích các concept" in system_prompt:
-        explanations = []
-        for candidate in payload["locked_candidates"]:
-            explanations.append(
-                {
-                    "candidate_id": candidate["candidate_id"],
-                    "reason": "Concept khớp các tín hiệu đã ghi nhận trong hồ sơ.",
-                    "why_it_fits": candidate["matched_signals"] or ["nằm trong ngân sách"],
-                    "personalization_tip": "Thêm thiệp viết tay mang dấu ấn cá nhân.",
-                    "verify_before_buying": candidate["possible_risks"],
-                    "budget_note": "Giá chỉ là ước tính và cần kiểm tra lại.",
-                    # Các trường giả này phải bị Tool 4 bỏ qua.
-                    "rank": 999,
-                    "estimated_price_range_vnd": {"minimum": 1, "maximum": 1},
-                }
-            )
-        return {"explanations": explanations}
-
-    raise RuntimeError("Fake LLM không nhận diện được prompt.")
-
-
-def _run_smoke_tests() -> None:
-    """Chạy smoke tests deterministic, không gọi API thật."""
-    tests: list[tuple[str, Callable[[], bool]]] = []
-
-    def add(name: str, check: Callable[[], bool]) -> None:
-        tests.append((name, check))
-
-    configure_tool_llm(_fake_structured_llm)
-    description = (
-        "Tặng quà sinh nhật cho bạn thân 21 tuổi, hướng nội, thích đọc sách "
-        "và trà, thích quà ý nghĩa, không thích mùi hương, ngân sách 800.000 VND."
-    )
-    step1 = json.loads(extract_recipient_profile(description))
-    profile = step1.get("recipient_profile", {})
-    step2 = json.loads(analyze_recipient_profile(profile))
-    analysis = step2.get("profile_analysis", {})
-    step3 = json.loads(generate_gift_candidates(profile, analysis, max_candidates=5))
-    candidates = step3.get("ranked_candidates", [])
-    step4 = json.loads(explain_recommendations(profile, analysis, candidates, top_k=5))
-
-    add("Tool 1 trả JSON success", lambda: step1.get("ok") is True)
-    add("Tool 2 trả JSON success", lambda: step2.get("ok") is True)
-    add("Tool 3 sinh candidate", lambda: step3.get("ok") is True and bool(candidates))
-    add("Tool 4 sinh explanation", lambda: step4.get("ok") is True)
-    add("Description rỗng trả error", lambda: json.loads(extract_recipient_profile(""))["ok"] is False)
-    add("Input sai kiểu trả error", lambda: json.loads(extract_recipient_profile(123))["ok"] is False)  # type: ignore[arg-type]
-    add("Exclusion thắng interest", lambda: "mùi hương" in profile.get("exclusions", []))
-    add("Candidate vượt budget bị loại", lambda: any(item["reason_code"] == "CANDIDATE_OVER_BUDGET" for item in step3["generation_summary"]["rejected_candidates"]))
-    add("Candidate vi phạm exclusion bị loại", lambda: any(item["reason_code"] == "CANDIDATE_VIOLATES_EXCLUSION" for item in step3["generation_summary"]["rejected_candidates"]))
-    add("Python tự gán candidate_id", lambda: all(re.fullmatch(r"C\d{3}", item["candidate_id"]) for item in candidates))
-    add("Candidate có score", lambda: all(isinstance(item.get("score"), int) for item in candidates))
-    add("Candidate có score_breakdown", lambda: all(isinstance(item.get("score_breakdown"), dict) for item in candidates))
-    add("Rank bắt đầu từ 1 liên tục", lambda: [item["rank"] for item in candidates] == list(range(1, len(candidates) + 1)))
-    add("Score giảm dần", lambda: [item["score"] for item in candidates] == sorted((item["score"] for item in candidates), reverse=True))
-    add("Tool 4 giữ nguyên ID", lambda: [item["candidate_id"] for item in step4["recommendations"]] == [item["candidate_id"] for item in candidates])
-    add("Tool 4 giữ nguyên rank", lambda: [item["rank"] for item in step4["recommendations"]] == [item["rank"] for item in candidates])
-    add("Tool 4 khóa khoảng giá", lambda: [item["estimated_price_range_vnd"] for item in step4["recommendations"]] == [item["estimated_price_range_vnd"] for item in candidates])
-    add("top_k âm trả error", lambda: json.loads(explain_recommendations(profile, analysis, candidates, top_k=-1))["ok"] is False)
-    add("Thiếu budget trả error ở Tool 3", lambda: json.loads(generate_gift_candidates({**profile, "budget_vnd": None}, analysis))["error"]["code"] == "MISSING_BUDGET")
-    add("Mọi output parse được", lambda: all(isinstance(item, dict) for item in (step1, step2, step3, step4)))
-
-    configure_tool_llm(None)
-    add("LLM chưa cấu hình trả error", lambda: json.loads(extract_recipient_profile(description))["error"]["code"] == "TOOL_LLM_NOT_CONFIGURED")
-
-    failures = 0
-    print("🧪 Role 2 — ReAct Generate Tools smoke tests\n")
-    for name, check in tests:
-        try:
-            passed = bool(check())
-        except Exception as exc:  # Test harness only.
-            passed = False
-            detail = str(exc)
-        else:
-            detail = ""
-        if passed:
-            print(f"[PASS] {name}")
-        else:
-            failures += 1
-            print(f"[FAIL] {name}: {detail}")
-
-    print(f"\nKết quả: {len(tests) - failures}/{len(tests)} PASS")
-    if failures:
-        raise SystemExit(1)
-
 
 if __name__ == "__main__":
     _run_smoke_tests()
